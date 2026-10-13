@@ -48,6 +48,23 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Install Android NDK before timing
+        env:
+          ANDROID_NDK_VERSION: 27.1.12297006
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$sdk_root"
+          sdkmanager="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager" ]]; then
+            sdkmanager="$(command -v sdkmanager)"
+          fi
+          "$sdkmanager" --install "ndk;$ANDROID_NDK_VERSION"
+
+      - name: Download Gradle wrapper before timing
+        working-directory: android
+        run: ./gradlew --version
+
       - name: Install JavaScript dependencies
         run: npm ci
 
@@ -81,15 +98,19 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          /usr/bin/time -f '%e' -o "$RUNNER_TEMP/gradle-build-seconds.txt" \
-            ./gradlew :app:assembleRelease
+          /usr/bin/time -f '%e\n%P\n%M' -o "$RUNNER_TEMP/gradle-build-time.txt" \
+            ./gradlew :app:assembleRelease --profile
           build_status=$?
           set -e
 
-          if [[ -f "$RUNNER_TEMP/gradle-build-seconds.txt" ]]; then
-            build_seconds="$(cat "$RUNNER_TEMP/gradle-build-seconds.txt")"
+          if [[ -f "$RUNNER_TEMP/gradle-build-time.txt" ]]; then
+            build_seconds="$(sed -n '1p' "$RUNNER_TEMP/gradle-build-time.txt")"
+            cpu_percent="$(sed -n '2p' "$RUNNER_TEMP/gradle-build-time.txt")"
+            max_rss_kb="$(sed -n '3p' "$RUNNER_TEMP/gradle-build-time.txt")"
           else
             build_seconds=not-recorded
+            cpu_percent=not-recorded
+            max_rss_kb=not-recorded
           fi
 
           if [[ "$build_status" -eq 0 ]]; then
@@ -98,8 +119,9 @@ jobs:
             result_status=failure
           fi
 
-          printf 'provider=%s\nseconds=%s\nstatus=%s\n' \
-            "$BENCHMARK_PROVIDER" "$build_seconds" "$result_status" > "$BENCHMARK_RESULT"
+          printf 'provider=%s\nseconds=%s\ncpu_percent=%s\nmax_rss_kb=%s\nstatus=%s\n' \
+            "$BENCHMARK_PROVIDER" "$build_seconds" "$cpu_percent" \
+            "$max_rss_kb" "$result_status" > "$BENCHMARK_RESULT"
           exit "$build_status"
 
       - name: Upload benchmark result
@@ -108,6 +130,17 @@ jobs:
         with:
           name: benchmark-${{ matrix.artifact }}
           path: ${{ runner.temp }}/benchmark-${{ matrix.artifact }}.txt
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Upload Gradle profile and resource metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ matrix.artifact }}
+          path: |
+            ${{ runner.temp }}/gradle-build-time.txt
+            android/build/reports/profile/
           if-no-files-found: warn
           retention-days: 1
 
@@ -148,23 +181,27 @@ jobs:
               "## Android release build benchmark",
               "",
               "Elapsed time for `:app:assembleRelease` (including signing). "
-              "Checkout, dependency setup, and other workflow steps are excluded.",
+              "Checkout, toolchain setup, and other workflow steps are excluded. "
+              "Gradle startup, dependency resolution, task execution, and signing are included.",
               "",
-              "| Provider | Build time | Result |",
-              "| --- | ---: | --- |",
+              "| Provider | Build time | CPU utilization | Peak memory | Result |",
+              "| --- | ---: | ---: | ---: | --- |",
           ]
 
           for provider in providers:
               result = rows.get(provider)
               if result is None:
-                  summary.append(f"| {provider} | not recorded | no result artifact |")
+                  summary.append(
+                      f"| {provider} | not recorded | not recorded | not recorded | no result artifact |"
+                  )
                   continue
 
               seconds = result["seconds"]
               if seconds.replace(".", "", 1).isdigit():
                   seconds = f"{float(seconds):.1f}s"
               summary.append(
-                  f"| {provider} | {seconds} | {result['status']} |"
+                  f"| {provider} | {seconds} | {result.get('cpu_percent', 'not recorded')} "
+                  f"| {result.get('max_rss_kb', 'not recorded')} KB | {result['status']} |"
               )
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary_file:
