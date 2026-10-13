@@ -15,11 +15,21 @@ jobs:
       matrix:
         include:
           - provider: GitHub Actions
+            artifact: github-actions
             runner: ubuntu-24.04
           - provider: Blacksmith
+            artifact: blacksmith
             runner: blacksmith-4vcpu-ubuntu-2404
 
     steps:
+      - name: Initialize benchmark result
+        env:
+          BENCHMARK_PROVIDER: ${{ matrix.provider }}
+          BENCHMARK_RESULT: ${{ runner.temp }}/benchmark-${{ matrix.artifact }}.txt
+        run: |
+          printf 'provider=%s\nseconds=not-run\nstatus=not-run\n' \
+            "$BENCHMARK_PROVIDER" > "$BENCHMARK_RESULT"
+
       - name: Check out source
         uses: actions/checkout@v5
 
@@ -65,8 +75,98 @@ jobs:
 
       - name: Build signed release APK
         working-directory: android
-        run: /usr/bin/time -f 'GRADLE_BUILD_SECONDS=%e' ./gradlew :app:assembleRelease
+        env:
+          BENCHMARK_PROVIDER: ${{ matrix.provider }}
+          BENCHMARK_RESULT: ${{ runner.temp }}/benchmark-${{ matrix.artifact }}.txt
+        run: |
+          set -euo pipefail
+          set +e
+          /usr/bin/time -f '%e' -o "$RUNNER_TEMP/gradle-build-seconds.txt" \
+            ./gradlew :app:assembleRelease
+          build_status=$?
+          set -e
+
+          if [[ -f "$RUNNER_TEMP/gradle-build-seconds.txt" ]]; then
+            build_seconds="$(cat "$RUNNER_TEMP/gradle-build-seconds.txt")"
+          else
+            build_seconds=not-recorded
+          fi
+
+          if [[ "$build_status" -eq 0 ]]; then
+            result_status=success
+          else
+            result_status=failure
+          fi
+
+          printf 'provider=%s\nseconds=%s\nstatus=%s\n' \
+            "$BENCHMARK_PROVIDER" "$build_seconds" "$result_status" > "$BENCHMARK_RESULT"
+          exit "$build_status"
+
+      - name: Upload benchmark result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/benchmark-${{ matrix.artifact }}.txt
+          if-no-files-found: warn
+          retention-days: 1
 
       - name: Remove release signing files
         if: always()
         run: rm -f android/app/release.keystore android/keystore.properties
+
+  summarize:
+    name: Compare build times
+    if: always()
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-*
+          path: benchmark-results
+          merge-multiple: true
+
+      - name: Add timing comparison to workflow summary
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          rows = {}
+          for result_file in Path("benchmark-results").glob("benchmark-*.txt"):
+              values = {}
+              for line in result_file.read_text().splitlines():
+                  key, value = line.split("=", 1)
+                  values[key] = value
+              rows[values["provider"]] = values
+
+          providers = ("GitHub Actions", "Blacksmith")
+          summary = [
+              "## Android release build benchmark",
+              "",
+              "Elapsed time for `:app:assembleRelease` (including signing). "
+              "Checkout, dependency setup, and other workflow steps are excluded.",
+              "",
+              "| Provider | Build time | Result |",
+              "| --- | ---: | --- |",
+          ]
+
+          for provider in providers:
+              result = rows.get(provider)
+              if result is None:
+                  summary.append(f"| {provider} | not recorded | no result artifact |")
+                  continue
+
+              seconds = result["seconds"]
+              if seconds.replace(".", "", 1).isdigit():
+                  seconds = f"{float(seconds):.1f}s"
+              summary.append(
+                  f"| {provider} | {seconds} | {result['status']} |"
+              )
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary_file:
+              summary_file.write("\n".join(summary) + "\n")
+          PY
